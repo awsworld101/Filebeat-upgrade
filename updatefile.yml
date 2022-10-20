@@ -1,0 +1,134 @@
+---
+- name: ELK Beats upgrade
+  hosts: all
+  gather_facts: no
+  become: yes
+  #ignore_errors: yes
+  vars_files:
+    # - ''
+  vars:
+    beats_version: 8.0.0
+    service_name: filebeat
+    tmp_path: "/var/tmp/beat-{{ beats_version }}"
+    ls_port: 5044
+    archive_loc:
+      - "/etc/{{ service_name }}"
+    beats_conf_file:
+      - /etc/{{ service_name }}/{{ service_name }}.yml
+    pkg_version: ''
+    conf_backup_file: "/etc/{{ service_name }}/{{ service_name }}.yml_backup_ansible_before_rpm_upgrade_{{ beats_version }}"
+    time_stamp: "{{ lookup('pipe','TZ=Asia/Singapore date') }}"
+
+  tasks:
+    - name: Check the temp dir exist or not
+      stat:
+        path: "{{ tmp_path }}"
+      register: check_tmp_dir
+
+    - name: Check the rpm dir missing or not
+      debug:
+        msg: "The RPM dir doesn't exist"
+      when: not check_tmp_dir.stat.exists
+
+    - name: Ensure beat is running on node
+      service:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: started
+      register: response
+
+    - name: Get the facts of all packages
+      package_facts:
+        manager: "auto"
+      register: packages_facts_reg
+      
+    - name: Display Current Beat Version
+      debug:
+        msg: "{{ item }} Installed Version: {{ ansible_facts.packages[item][0]['version'] }}"
+      loop: "{{ ansible_facts.packages | list | select('search',service_name)|list}}"
+      when: not packages_facts_reg is skipped
+
+    - name: Set fact for pkg version
+      set_fact:
+        pkg_version: "{{ ansible_facts.packages[item][0]['current_package_version'] }}"
+      loop: "{{ ansible_facts.packages | list | select('search',service_name)|list}}"
+      when: not packages_facts_reg is skipped
+      register: set_fact_pkg_ver
+
+    - debug:
+        msg: "{{ pkg_version }} is lower or equal than {{ beats_version }}"
+      when: beats_version is version(pkg_version, '>=') and check_tmp_dir.stat.exists
+
+    - name: Get RPM from Bitbucket
+      git: 
+        repo: ""
+        dest: "{{ tmp_path }}/"
+        depth: 1
+       # accept_hostkey: yes
+        clone: yes
+      when: ansible_facts['distribution_major_version'] == "6"
+
+    - name: Get RPM from Bitbucket
+      git: 
+        repo: ""
+        dest: "{{ tmp_path }}/"
+        depth: 1
+        #accept_hostkey: yes
+        clone: yes
+      when: ansible_facts['distribution_major_version'] >= "7"
+
+    - name: Backup/Zip the config dirs
+      archive:
+        path: "{{ item }}"
+        dest: "{{ item }}_{{time_stamp}}.tar.zip"
+        format: zip
+      loop: "{{ archive_loc }}"
+      when: beats_version is version(pkg_version, operator='gt', strict=True) and 
+            check_tmp_dir.stat.exists
+
+    - name: Check the RPM in the src
+      find:
+        paths: "{{ tmp_path }}"
+        patterns: "{{ service_name }}*.rpm"
+      register: find_rpm_results
+      when: beats_version is version(pkg_version, operator='gt', strict=True) and 
+            check_tmp_dir.stat.exists
+
+    - name: Backup the config file
+      copy:
+        src: "{{ item }}"
+        dest: "{{ conf_backup_file }}"
+        force: no
+        remote_src: yes
+      loop: "{{ beats_conf_file }}"
+      register: file_copy
+      when: beats_version is version(pkg_version, operator='gt', strict=True) and 
+            (find_rpm_results.matched != 0) and (check_tmp_dir.stat.exists)
+            
+    - name: Stop {{ service_name }} on node
+      service:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: stopped
+      register: response
+      when: beats_version is version(pkg_version, operator='gt', strict=True) and 
+            (find_rpm_results.matched != 0) and (check_tmp_dir.stat.exists)
+
+    - name: Upgrade/Install package
+      yum:
+        name: "{{ item.path }}"
+        state: present
+      with_items: "{{ find_rpm_results.files }}"
+      retries: 5
+      register: upgrade_stat
+      when: beats_version is version(pkg_version, operator='gt', strict=True) and 
+            (find_rpm_results.matched != 0) and (check_tmp_dir.stat.exists)
+
+    - name: Restart {{ service_name }} on node
+      service:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: restarted
+        daemon_reload: yes
+      register: response
+      when: upgrade_stat is changed
